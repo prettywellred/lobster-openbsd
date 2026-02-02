@@ -8,6 +8,7 @@ lobster_editor=${VISUAL:-${EDITOR}}
 tmp_dir="${TMPDIR:-/tmp}/lobster" && mkdir -p "$tmp_dir"
 lobster_socket="${TMPDIR:-/tmp}/lobster.sock" # Used by mpv (check the play_video function)
 lobster_logfile="${TMPDIR:-/tmp}/lobster.log"
+tty="${TTY:-/dev/tty}"
 applications="$HOME/.local/share/applications/lobster" # Used for external menus (for now just rofi)
 images_cache_dir="$tmp_dir/lobster-images"             # Used for storing downloaded images of movie covers
 STATE=""                                               # Used for main state machine
@@ -26,14 +27,58 @@ command -v notify-send >/dev/null 2>&1 && notify="true" || notify="false" # chec
 send_notification() {
     [ "$json_output" = "true" ] && return
     if [ "$use_external_menu" = "false" ] || [ -z "$use_external_menu" ]; then
-        [ -z "$4" ] && printf "\33[2K\r\033[1;34m%s\n\033[0m" "$1" && return
-        [ -n "$4" ] && printf "\33[2K\r\033[1;34m%s - %s\n\033[0m" "$1" "$4" && return
+        # stdout/stderr are redirected to the logfile later; always show messages on the user's terminal
+        [ -z "$4" ] && printf "\33[2K\r\033[1;34m%s\n\033[0m" "$1" >"$tty" 2>/dev/null && return
+        [ -n "$4" ] && printf "\33[2K\r\033[1;34m%s - %s\n\033[0m" "$1" "$4" >"$tty" 2>/dev/null && return
     fi
     [ -z "$2" ] && timeout=3000 || timeout="$2" # default timeout is 3 seconds
     if [ "$notify" = "true" ]; then
-        [ -z "$3" ] && notify-send "$1" "$4" -t "$timeout" -h string:x-dunst-stack-tag:vol # the -h string:x-dunst-stack-tag:vol is used for overriding previous notifications
+        [ -z "$3" ] && notify-send "$1" "$4" -t "$timeout" -h string:x-dunst-stack-tag:vol # override previous notifications
         [ -n "$3" ] && notify-send "$1" "$4" -t "$timeout" -i "$3" -h string:x-dunst-stack-tag:vol
     fi
+}
+
+### OpenBSD / portability helpers ###
+curl_get() {
+    # In debug mode, show curl trace on your terminal so hangs are obvious
+    if [ "$debug" = "true" ]; then
+        printf "curl_get: %s\n" "$*" >"$tty" 2>/dev/null
+        _curl_stderr="$tty"
+        _curl_verbose="-v"
+        _curl_silent=""
+    else
+        _curl_stderr="$lobster_logfile"
+        _curl_verbose=""
+        _curl_silent="-sS"
+    fi
+
+    # Hard-kill wrapper (avoids cases where curl wedges beyond --max-time)
+    # Uses perl alarm, which exists on OpenBSD base.
+    perl -e '
+        $SIG{ALRM} = sub { die "curl timeout\n" };
+        alarm 30;
+        exec @ARGV;
+    ' \
+    env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+        curl -4 -f $_curl_silent -L $_curl_verbose \
+        --noproxy '*' \
+        --connect-timeout 10 \
+        --max-time 25 \
+        -H "User-Agent: lobster/${LOBSTER_VERSION}" \
+        "$@" \
+    2>>"$_curl_stderr"
+}
+
+# Portable in-place sed: works on OpenBSD/BSD/GNU
+sedi() {
+    _expr=$1
+    _file=$2
+    if sed -i '' -e "$_expr" "$_file" 2>/dev/null; then return 0; fi
+    if sed -i -e "$_expr" "$_file" 2>/dev/null; then return 0; fi
+    if sed -i.bak -e "$_expr" "$_file" 2>/dev/null; then rm -f "$_file.bak" 2>/dev/null; return 0; fi
+    _tmp=$(mktemp "${TMPDIR:-/tmp}/lobster.sed.XXXXXX") || return 1
+    sed -e "$_expr" "$_file" >"$_tmp" && cat "$_tmp" >"$_file"
+    rm -f "$_tmp" 2>/dev/null
 }
 
 ### HTML Decoding ###
@@ -43,7 +88,7 @@ command -v "hxunent" >/dev/null 2>&1 && hxunent="hxunent" || hxunent="tee /dev/n
 # Note: experimental feature
 presence_client_id="1239340948048187472" # Discord Client ID
 # shellcheck disable=SC2154
-discord_ipc="${XDG_RUNTIME_DIR}/discord-ipc-0" # Discord IPC Socket (Could also be discord-ipc-1 if using arRPC afaik)
+discord_ipc="${XDG_RUNTIME_DIR}/discord-ipc-0" # Discord IPC Socket
 handshook="$tmp_dir/handshook"                 # Indicates if the RPC handshake has been done
 ipclog="$tmp_dir/ipclog"                       # Logs the RPC events
 presence="$tmp_dir/presence"                   # Used by the rich presence function
@@ -61,8 +106,6 @@ case "$(uname -s)" in
 esac
 
 # Checks if any of the provided arguments are -e or --edit
-# If so, it will edit the config file
-# This was added for pure convenience (for me)
 if printf "%s" "$*" | grep -qE "\-\-edit|\-e" 2>/dev/null; then
     #shellcheck disable=1090
     . "${config_file}"
@@ -133,15 +176,6 @@ usage() {
     -x, --debug
       Enable debug mode (prints out debug info to stdout and also saves it to \$TEMPDIR/lobster.log)
 
-  Note:
-    All arguments can be specified in the config file as well.
-    If an argument is specified in both the config file and the command line, the command line argument will be used.
-
-  Some example usages:
-    ${0##*/} -i a silent voice --rofi
-    ${0##*/} -l spanish -q 720 fight club -i -d
-    ${0##*/} -l spanish blade runner --json
-
 " "${0##*/}"
 }
 
@@ -156,14 +190,13 @@ dep_ch() {
 }
 
 ### Default Configuration ###
-# this function is ran after the user's config file is "checked" (source'd)
 configuration() {
     [ -n "$XDG_CONFIG_HOME" ] && config_dir="$XDG_CONFIG_HOME/lobster" || config_dir="$HOME/.config/lobster"
     [ -n "$XDG_DATA_HOME" ] && data_dir="$XDG_DATA_HOME/lobster" || data_dir="$HOME/.local/share/lobster"
     [ ! -d "$config_dir" ] && mkdir -p "$config_dir"
     [ ! -d "$data_dir" ] && mkdir -p "$data_dir"
     #shellcheck disable=1090
-    [ -f "$config_file" ] && . "${config_file}" # source the user's config file
+    [ -f "$config_file" ] && . "${config_file}"
     [ -z "$base" ] && base="flixhq.to"
     [ -z "$player" ] && player="mpv"
     [ -z "$download_dir" ] && download_dir="$PWD"
@@ -190,7 +223,6 @@ configuration() {
     case "$(uname -s)" in
         MINGW* | *Msys)
             if [ -z "$watchlater_dir" ]; then
-                # shellcheck disable=SC2154
                 case "$(command -v "$player")" in
                     *scoop*) watchlater_dir="$HOMEPATH/scoop/apps/mpv/current/portable_config/watch_later/" ;;
                     *) watchlater_dir="$LOCALAPPDATA/mpv/watch_later" ;;
@@ -201,12 +233,9 @@ configuration() {
     esac
 }
 
-# The reason I use additional file descriptors is because of the use of tee
-# which when piped into would hijack the terminal, which was unwanted behavior
-# since there are SSH use cases for mpv and since I wanted to have a logging mechanism
+# Logging redirection
 exec 3>&1 4>&2 1>"$lobster_logfile" 2>&1
 {
-    # check that the necessary programs are installed
     dep_ch "grep" "$sed" "curl" "fzf" || true
     if [ "$use_external_menu" = "true" ]; then
         dep_ch "rofi" || true
@@ -215,7 +244,6 @@ exec 3>&1 4>&2 1>"$lobster_logfile" 2>&1
         dep_ch "awk" "nc" || true
     fi
 
-    ### Launchers stuff (rofi, fzf, etc.) ###
     generate_desktop() {
         cat <<EOF
 [Desktop Entry]
@@ -226,35 +254,32 @@ Type=Application
 Categories=lobster;
 EOF
     }
-    # A launcher is a utility used to select an option from a list (fzf, rofi)
-    # launcher [prompt] [columns-to-display]
+
     launcher() {
         case "$use_external_menu" in
             "true")
                 [ -z "$2" ] && rofi -kb-mode-next "" -kb-mode-previous "" -kb-custom-1 Shift+Left -kb-custom-2 Shift+Right -sort -dmenu -i -width 1500 -p "" -mesg "$1"
                 [ -n "$2" ] && rofi -kb-mode-next "" -kb-mode-previous "" -kb-custom-1 Shift+Left -kb-custom-2 Shift+Right -sort -dmenu -i -width 1500 -p "" -mesg "$1" -display-columns "$2"
-                # Gives rc=10 on pressing kb-custom-1 and rc=11 on pressing kb-custom-2
                 rc=$?
                 ;;
             *)
                 [ -z "$2" ] && fzf_out=$(fzf --bind "shift-right:accept" --expect=shift-left --cycle --reverse --prompt "$1")
                 [ -n "$2" ] && fzf_out=$(fzf --bind "shift-right:accept" --expect=shift-left --cycle --reverse --prompt "$1" --with-nth "$2" -d "\t")
                 rc=$?
-                # Uses fzf expect to look for back button press
                 case $fzf_out in
                     shift-left"$nl"*)
                         rc="$BACK_CODE"
                         fzf_out=${fzf_out#*"$nl"}
                         ;;
                     "$nl"*) fzf_out=${fzf_out#"$nl"} ;;
-                    *) exit 1 ;; # Should not reach here
+                    *) exit 1 ;;
                 esac
                 printf '%s\n' "$fzf_out"
                 ;;
         esac
         return "$rc"
     }
-    # helper function to be able to display only an "nth" column in fzf/rofi without altering the stdin
+
     nth() {
         stdin=$(cat -)
         [ -z "$stdin" ] && return 1
@@ -264,7 +289,6 @@ EOF
         [ -n "$line" ] && printf "%s" "$stdin" | $sed -nE "s@^$line\t(.*)@\1@p" || exit 1
     }
 
-    ### User Prompts ###
     prompt_to_continue() {
         if [ "$media_type" = "tv" ]; then
             continue_choice=$(printf "Next episode\nReplay episode\nExit\nSearch" | launcher "Select: ")
@@ -275,10 +299,10 @@ EOF
         [ "$rc" -eq "$BACK_CODE" ] && exit 0
     }
 
-    ### Searching/Selecting ###
     get_input() {
         if [ "$use_external_menu" = "false" ]; then
-            printf "Search Movie/TV Show: " && read -r query
+            printf "Search Movie/TV Show: " >"$tty"
+            read -r query
         else
             if [ -n "$rofi_prompt_config" ]; then
                 query=$(printf "" | rofi -kb-mode-next "" -kb-mode-previous "" -kb-custom-1 Shift+Left -theme "$rofi_prompt_config" -sort -dmenu -i -width 1500 -p "" -mesg "Search Movie/TV Show")
@@ -287,7 +311,6 @@ EOF
             fi
         fi
         rc=$?
-        # rofi return exit code 1 when user submits custom text, so check >1 for exit
         [ "$rc" -gt 1 ] && exit 0
         [ -n "$query" ] && query=$(echo "$query" | tr ' ' '-')
         if [ -z "$query" ]; then
@@ -295,11 +318,52 @@ EOF
             exit 1
         fi
     }
-    search() {
-        response=$(curl -s "https://${base}/search/$1" | $sed ':a;N;$!ba;s/\n//g;s/class="flw-item"/\n/g' |
-            $sed -nE "s@.*img data-src=\"([^\"]*)\".*<a href=\".*/(tv|movie)/watch-.*-([0-9]*)\".*title=\"([^\"]*)\".*class=\"fdi-item\">([^<]*)</span>.*@\1\t\3\t\2\t\4 [\5]@p")
-        [ -z "$response" ] && send_notification "Error" "1000" "" "No results found" && exit 1
-    }
+
+		search() {
+    		url="https://${base}/search/$1"
+    		send_notification "Fetching search page…" "1500" "" "$url"
+
+ 		   html_file="$tmp_dir/search.html"
+    		rm -f "$html_file" 2>/dev/null
+
+ 		   # Download to file first (decouples curl from the parsing pipeline)
+    		if ! curl_get -o "$html_file" "$url"; then
+        		send_notification "Error" "3000" "" "Failed to fetch search page"
+        		exit 1
+    		fi
+
+    # Show size so we know we're parsing real content
+    if [ "$debug" = "true" ]; then
+        sz=$(wc -c <"$html_file" 2>/dev/null | tr -d ' ')
+        printf "search(): downloaded %s bytes\n" "${sz:-?}" >"$tty" 2>/dev/null
+    fi
+
+    # Fast newline flattening, then split entries by flw-item marker
+		response=$(
+    perl -0777 -ne '
+        while (
+            /class="flw-item".*?img\s+data-src="([^"]+)".*?
+             <a\s+href="[^"]*\/(tv|movie)\/watch-[^"]*?-([0-9]+)".*?
+             title="([^"]+)".*?
+             class="fdi-item">([^<]+)</sgx
+        ) {
+            print "$1\t$3\t$2\t$4 [$5]\n";
+        }
+    ' "$html_file"
+)
+
+    if [ -z "$response" ]; then
+        # Helpful hint: often Cloudflare returns a page but the HTML layout changes
+        send_notification "Error" "4000" "" "No parseable results (site HTML changed / CF page?)"
+        exit 1
+    fi
+
+    if [ "$debug" = "true" ]; then
+        cnt=$(printf "%s\n" "$response" | wc -l | tr -d ' ')
+        printf "search(): parsed %s results\n" "${cnt:-0}" >"$tty" 2>/dev/null
+    fi
+}
+
     choose_search() {
         if [ -z "$response" ]; then
             [ -z "$query" ] && get_input
@@ -308,6 +372,7 @@ EOF
         fi
         STATE="MEDIA"
     }
+
     choose_media() {
         if [ "$image_preview" = "true" ]; then
             if [ "$use_external_menu" = "false" ] && [ "$use_ueberzugpp" = "true" ]; then
@@ -324,13 +389,12 @@ EOF
             else
                 choice=$(printf "%s" "$response" | fzf --bind "shift-right:accept" --expect=shift-left --cycle --reverse --with-nth 4 -d "\t" --header "Choose a Movie or TV Show")
                 rc=$?
-                # Check for back-button
                 case $choice in
                     shift-left"$nl"*)
                         rc="$BACK_CODE"
                         choice=${choice#*"$nl"}
                         ;;
-                    "$nl"*) choice=${choice#*"$nl"} ;;
+                    "$nl"*) choice=${choice#"$nl"} ;;
                     *) exit 1 ;;
                 esac
             fi
@@ -340,14 +404,12 @@ EOF
             media_type=$(printf "%s" "$choice" | $sed -nE "s@.* *(tv|movie)[[:space:]]*(.*) \[.*\]@\1@p")
         fi
 
-        # Check if back button pressed
         if [ "$rc" -eq "$BACK_CODE" ]; then
             STATE="SEARCH"
             response=""
             query=""
             choice=""
             return 0
-        # Don't exit on rc="$FORWARD_CODE", it means rofi kb-custom-2 was pressed
         elif [ "$rc" -ne 0 ] && [ "$rc" -ne "$FORWARD_CODE" ]; then
             exit 0
         fi
@@ -359,81 +421,103 @@ EOF
             STATE="PLAY"
         fi
     }
-    choose_season() {
-        season_line=$(
-            curl -s "https://${base}/ajax/v2/tv/seasons/${media_id}" |
-                $sed -nE 's@.*href=".*-([0-9]*)">(.*)</a>@\2\t\1@p' |
-                launcher "Select a season: " "1"
-        )
-        rc=$?
-        if [ "$rc" -eq "$BACK_CODE" ]; then
-            STATE="MEDIA"
-            return 0
-        elif [ "$rc" -ne 0 ] && [ "$rc" -ne "$FORWARD_CODE" ]; then
-            exit 0
-        fi
 
-        [ -z "$season_line" ] && exit 1
+		choose_season() {
+  	 		season_line=$(
+       		curl_get "https://${base}/ajax/v2/tv/seasons/${media_id}" |
+       		perl -0777 -ne '
+           		while (/href="[^"]*-([0-9]+)">(.*?)<\/a>/sg) {
+               		$t=$2; $t =~ s/<[^>]+>//g; $t =~ s/^\s+|\s+$//g;
+               		next if $t eq "";
+               		print "$t\t$1\n";
+          		 }
+      		 ' |
+      		 launcher "Select a season: " "1"
+   		)
+   		rc=$?
 
-        season_title=$(printf '%s' "$season_line" | cut -f1)
-        season_id=$(printf '%s' "$season_line" | cut -f2)
-        STATE="EPISODE"
-    }
-    choose_episode() {
-        ep_line=$(
-            curl -s "https://${base}/ajax/v2/season/episodes/${season_id}" |
-                $sed ':a;N;$!ba;s/\n//g;s/class="nav-item"/\n/g' |
-                $sed -nE 's@.*data-id="([0-9]*)".*title="([^"]*)">.*@\2\t\1@p' |
-                $hxunent |
-                launcher "Select an episode: " "1"
-        )
-        rc=$?
+		   if [ "$rc" -eq "$BACK_CODE" ]; then
+   		    STATE="MEDIA"
+      		 return 0
+   		elif [ "$rc" -ne 0 ] && [ "$rc" -ne "$FORWARD_CODE" ]; then
+       		exit 0
+   		fi
 
-        if [ "$rc" -eq "$BACK_CODE" ]; then
-            STATE="SEASON"
-            return 0
-        elif [ "$rc" -ne 0 ] && [ "$rc" -ne "$FORWARD_CODE" ]; then
-            exit 0
-        fi
+ 		  [ -z "$season_line" ] && exit 1
 
-        episode_title=$(printf '%s' "$ep_line" | cut -f1)
-        data_id=$(printf '%s' "$ep_line" | cut -f2)
+			season_title=$(printf '%s' "$season_line" | cut -f1)
+			season_id=$(printf '%s' "$season_line" | cut -f2)
+			STATE="EPISODE"
+		}
 
-        episode_id=$(
-            curl -s "https://${base}/ajax/v2/episode/servers/${data_id}" |
-                $sed ':a;N;$!ba;s/\n//g;s/class="nav-item"/\n/g' |
-                $sed -nE 's@.*data-id="([0-9]*)".*title="([^"]*)".*@\1\t\2@p' |
-                grep "$provider" | cut -f1 | head -n1
-        )
+		choose_episode() {
+    		ep_line=$(
+        		curl_get "https://${base}/ajax/v2/season/episodes/${season_id}" |
+    		    perl -0777 -ne '
+        		    while (/class="nav-item".*?data-id="([0-9]+)".*?title="([^"]+)"/sg) {
+            		    $id=$1; $t=$2;
+              		  $t =~ s/^\s+|\s+$//g;
+               		 print "$t\t$id\n";
+            		}
+       		 ' |
+        		$hxunent |
+       		 launcher "Select an episode: " "1"
+    		)
+    		rc=$?
 
-        keep_running="true"
-        STATE="PLAY"
-    }
-    next_episode_exists() {
-        episodes_list=$(curl -s "https://${base}/ajax/v2/season/episodes/${season_id}" | $sed ':a;N;$!ba;s/\n//g;s/class="nav-item"/\n/g' |
-            $sed -nE "s@.*data-id=\"([0-9]*)\".*title=\"([^\"]*)\">.*@\2\t\1@p" | $hxunent)
-        next_episode=$(printf "%s" "$episodes_list" | $sed -n "/$data_id/{n;p;}")
+ 		   if [ "$rc" -eq "$BACK_CODE" ]; then
+    		    STATE="SEASON"
+       		 return 0
+    		elif [ "$rc" -ne 0 ] && [ "$rc" -ne "$FORWARD_CODE" ]; then
+        		exit 0
+    		fi
+
+		    episode_title=$(printf '%s' "$ep_line" | cut -f1)
+    		data_id=$(printf '%s' "$ep_line" | cut -f2)
+
+ 		   episode_id=$(
+    		    curl_get "https://${base}/ajax/v2/episode/servers/${data_id}" |
+        		perl -0777 -ne '
+            		while (/class="nav-item".*?data-id="([0-9]+)".*?title="([^"]+)"/sg) {
+                		print "$1\t$2\n";
+          		  }
+        		' |
+        		grep "$provider" | cut -f1 | head -n1
+   		 )
+
+ 		   keep_running="true"
+    		STATE="PLAY"
+		}
+
+
+		    next_episode_exists() {
+    		    episodes_list=$(
+    		curl_get "https://${base}/ajax/v2/season/episodes/${season_id}" |
+    		perl -0777 -ne '
+        		while (/class="nav-item".*?data-id="([0-9]+)".*?title="([^"]+)"/sg) {
+            		print "$2\t$1\n";
+       		 }
+    		' | $hxunent
+		)
+				next_episode=$(printf "%s" "$episodes_list" | $sed -n "/$data_id/{n;p;}")
         [ -n "$next_episode" ] && return
-        tmp_season_id=$(curl -s "https://${base}/ajax/v2/tv/seasons/${media_id}" | $sed -n "/href=\".*-$season_id/{n;n;n;n;p;}" | $sed -nE "s@.*href=\".*-([0-9]*)\">(.*)</a>@\2\t\1@p")
-        [ -z "$tmp_season_id" ] && return
+
+				[ -z "$tmp_season_id" ] && return
         season_title=$(printf "%s" "$tmp_season_id" | cut -f1)
         season_id=$(printf "%s" "$tmp_season_id" | cut -f2)
-        next_episode=$(curl -s "https://${base}/ajax/v2/season/episodes/${season_id}" | $sed ':a;N;$!ba;s/\n//g;s/class="nav-item"/\n/g' |
+        next_episode=$(curl_get "https://${base}/ajax/v2/season/episodes/${season_id}" | $sed ':a;N;$!ba;s/\n//g;s/class="nav-item"/\n/g' |
             $sed -nE "s@.*data-id=\"([0-9]*)\".*title=\"([^\"]*)\">.*@\2\t\1@p" | $hxunent | head -1)
         [ -n "$next_episode" ] && return
     }
 
     ### Image Preview ###
     maybe_download_thumbnails() {
-        # Only downloads thumbnails again if every thumbnail is not already in images_cache_dir
         need_dl=0
         tab="$(printf '\t')"
-
-        # keep the while-loop in the current shell
         while IFS="$tab" read -r cover_url id type title; do
-            [ -z "$cover_url" ] && continue # skip empty lines
+            [ -z "$cover_url" ] && continue
             poster="$images_cache_dir/  $title ($type)  $id.jpg"
-            [ ! -f "$poster" ] && need_dl=1 && break # one miss is enough
+            [ ! -f "$poster" ] && need_dl=1 && break
         done <<EOF
 $1
 EOF
@@ -443,26 +527,20 @@ EOF
             download_thumbnails "$1"
         fi
     }
+
     download_thumbnails() {
         pids=""
-
-        # run the while-loop in the current shell
         while IFS='     ' read -r cover_url id type title; do
-            [ -z "$cover_url" ] && continue                    # skip empty lines
-            printf '%s\n' "$cover_url" >"$tmp_dir/image_links" # For Discord rich presence
+            [ -z "$cover_url" ] && continue
+            printf '%s\n' "$cover_url" >"$tmp_dir/image_links"
 
-            # Sets res to 1000x1000
-            cover_url=$(printf '%s\n' "$cover_url" |
-                sed -E 's:/[0-9]+x[0-9]+/:/1000x1000/:')
-
+            cover_url=$(printf '%s\n' "$cover_url" | sed -E 's:/[0-9]+x[0-9]+/:/1000x1000/:')
             poster_path="$images_cache_dir/  $title ($type)  $id.jpg"
-            curl -s -o "$poster_path" "$cover_url" &
+            curl_get -o "$poster_path" "$cover_url" >/dev/null 2>&1 &
             pids="$pids $!"
 
             if [ "$use_external_menu" = "true" ]; then
                 entry="$tmp_dir/applications/$id.desktop"
-                # The reason for the spaces is so that only the title can be displayed when using rofi
-                # or fzf, while still keeping the id and type in the string after it's selected
                 generate_desktop "$title ($type)  $id" "$poster_path" >"$entry" &
                 pids="$pids $!"
             fi
@@ -470,15 +548,15 @@ EOF
 $1
 EOF
 
-        # Wait for background jobs to finish
         for pid in $pids; do
             wait "$pid" 2>/dev/null
         done
     }
-    # defaults to chafa
+
     image_preview_fzf() {
         if [ "$use_ueberzugpp" = "true" ]; then
-            UB_PID_FILE="$tmp_dir.$(uuidgen)"
+            # uuidgen isn't guaranteed on OpenBSD; mktemp is.
+            UB_PID_FILE=$(mktemp "${TMPDIR:-/tmp}/lobster.ubpid.XXXXXX") || exit 1
             if [ -z "$ueberzug_output" ]; then
                 ueberzugpp layer --no-stdin --silent --use-escape-codes --pid-file "$UB_PID_FILE"
             else
@@ -494,13 +572,13 @@ EOF
                     rc="$BACK_CODE"
                     choice=${choice#*"$nl"}
                     ;;
-                "$nl"*) choice=${choice#*"$nl"} ;;
+                "$nl"*) choice=${choice#"$nl"} ;;
                 *) exit 1 ;;
             esac
             ueberzugpp cmd -s "$LOBSTER_UEBERZUG_SOCKET" -a exit
+            rm -f "$UB_PID_FILE" 2>/dev/null
         else
             dep_ch "chafa" || true
-            # shellcheck disable=SC2154
             [ "$TERM_PROGRAM" = "vscode" ] && fmt="-f sixels --margin-bottom 8" || fmt=""
             [ -n "$chafa_dims" ] && dim="-s $chafa_dims"
             choice=$(find "$images_cache_dir" -type f -exec basename {} \; | fzf \
@@ -515,12 +593,13 @@ EOF
                     rc="$BACK_CODE"
                     choice=${choice#*"$nl"}
                     ;;
-                "$nl"*) choice=${choice#*"$nl"} ;;
+                "$nl"*) choice=${choice#"$nl"} ;;
                 *) exit 1 ;;
             esac
         fi
         return "$rc"
     }
+
     select_desktop_entry() {
         if [ "$use_external_menu" = "true" ]; then
             if [ -n "$image_config_path" ]; then
@@ -550,13 +629,11 @@ EOF
     ### Scraping/Decryption ###
     get_embed() {
         if [ "$media_type" = "movie" ]; then
-            # request to get the episode id
-            movie_page="https://${base}"$(curl -s "https://${base}/ajax/movie/episodes/${media_id}" |
+            movie_page="https://${base}"$(curl_get "https://${base}/ajax/movie/episodes/${media_id}" |
                 $sed ':a;N;$!ba;s/\n//g;s/class="nav-item"/\n/g' | $sed -nE "s@.*href=\"([^\"]*)\"[[:space:]]*title=\"${provider}\".*@\1@p")
             episode_id=$(printf "%s" "$movie_page" | $sed -nE "s_.*-([0-9]*)\.([0-9]*)\$_\2_p")
         fi
-        # request to get the embed
-        embed_link=$(curl -s "https://${base}/ajax/episode/sources/${episode_id}" | $sed -nE "s_.*\"link\":\"([^\"]*)\".*_\1_p")
+        embed_link=$(curl_get "https://${base}/ajax/episode/sources/${episode_id}" | $sed -nE "s_.*\"link\":\"([^\"]*)\".*_\1_p")
         if [ -z "$embed_link" ]; then
             send_notification "Error" "Could not get embed link"
             exit 1
@@ -565,7 +642,7 @@ EOF
 
     extract_from_embed() {
         api_url="${API_URL}/?url=${embed_link}"
-        json_data=$(curl -s "${api_url}")
+        json_data=$(curl_get "${api_url}")
         video_link=$(printf "%s" "$json_data" | $sed -nE "s_.*\"file\":\"([^\"]*\.m3u8)\".*_\1_p" | head -1)
 
         [ -n "$quality" ] && video_link=$(printf "%s" "$video_link" | sed -e "s|/playlist.m3u8|/$quality/index.m3u8|")
@@ -618,19 +695,22 @@ EOF
                 fi
                 ;;
             *) send_notification "This media type is not supported" ;;
-
         esac
     }
+
     save_history() {
         [ -z "$image_link" ] && image_link="$(grep "$media_id" "$tmp_dir/image_links" | cut -f1)"
         case $media_type in
             movie)
                 if [ "$progress" -gt "90" ]; then
-                    $sed -i "/$media_id/d" "$histfile"
+                    _mid=$(printf "%s" "$media_id" | sed 's/[\/&]/\\&/g')
+                    sedi "/$_mid/d" "$histfile"
                     send_notification "Deleted from history" "5000" "" "$title"
                 else
                     if grep -q -- "$media_id" "$histfile" 2>/dev/null; then
-                        $sed -i "s|\t[0-9:]*\t$media_id|\t$position\t$media_id|1" "$histfile"
+                        _mid=$(printf "%s" "$media_id" | sed 's/[\/&]/\\&/g')
+                        _pos=$(printf "%s" "$position" | sed 's/[\/&]/\\&/g')
+                        sedi "s|\t[0-9:]*\t$_mid|\t$_pos\t$_mid|1" "$histfile"
                         send_notification "Saved to history" "5000" "" "$title"
                     else
                         printf "%s\t%s\t%s\t%s\t%s\n" "$title" "$position" "$media_id" "$media_type" "$image_link" >>"$histfile"
@@ -645,11 +725,20 @@ EOF
                         position="00:00:00"
                         episode_title=$(printf "%s" "$next_episode" | cut -f1)
                         data_id=$(printf "%s" "$next_episode" | cut -f2)
-                        episode_id=$(curl -s "https://${base}/ajax/v2/episode/servers/${data_id}" | $sed ':a;N;$!ba;s/\n//g;s/class="nav-item"/\n/g' |
-                            $sed -nE "s@.*data-id=\"([0-9]*)\".*title=\"([^\"]*)\".*@\1\t\2@p" | grep "$provider" | cut -f1)
+                        episode_id=$(
+                            curl_get "https://${base}/ajax/v2/episode/servers/${data_id}" |
+                            perl -0777 -ne '
+                                while (/class="nav-item".*?data-id="([0-9]+)".*?title="([^"]+)"/sg) {
+                                    print "$1\t$2\n";
+                                }
+                            ' |
+                            grep -m1 -F "$provider" | cut -f1
+                        )
+   
                         send_notification "Updated to next episode" "5000" "" "$episode_title"
                     else
-                        $sed -i "/$media_id/d" "$histfile"
+                        _mid=$(printf "%s" "$media_id" | sed 's/[\/&]/\\&/g')
+                        sedi "/$_mid/d" "$histfile"
                         send_notification "Completed" "5000" "" "$title"
                         return
                     fi
@@ -657,9 +746,13 @@ EOF
                     send_notification "Saved to history" "5000" "$images_cache_dir/  $title ($media_type)  $media_id.jpg" "$title"
                 fi
 
-                # If entry exists in hist file then update it, otherwise append new line
-                if grep -q -- "$media_id" "$histfile" 2>/dev/null; then
-                    $sed -i "s|^.*\t$media_id\t.*$|$title\t$position\t$media_id\t$media_type\t$season_id\t$episode_id\t$season_title\t$episode_title\t$data_id\t$image_link|" "$histfile"
+                    if grep -q -- "$media_id" "$histfile" 2>/dev/null; then
+                    _mid=$(printf "%s" "$media_id" | sed 's/[\/&]/\\&/g')
+                    _rep=$(printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" \
+                        "$title" "$position" "$media_id" "$media_type" \
+                        "$season_id" "$episode_id" "$season_title" "$episode_title" "$data_id" "$image_link" \
+                        | sed 's/[\/&]/\\&/g')
+                    sedi "s|^.*\t$_mid\t.*$|$_rep|" "$histfile"
                 else
                     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$title" "$position" "$media_id" "$media_type" \
                         "$season_id" "$episode_id" "$season_title" "$episode_title" "$data_id" "$image_link" >>"$histfile"
@@ -668,6 +761,7 @@ EOF
             *) notify-send "Error" "Unknown media type" ;;
         esac
     }
+
     play_from_history() {
         [ ! -f "$histfile" ] && send_notification "No history file found" "5000" "" && exit 1
         [ "$watched_history" = 1 ] && exit 0
@@ -728,11 +822,11 @@ EOF
         printf "\\001\\000\\000\\000"
         for i in 0 8 16 24; do
             len=$((len >> i))
-            #shellcheck disable=SC2059
             printf "\\$(printf "%03o" "$len")"
         done
         printf "%s" "$1"
     }
+
     update_rich_presence() {
         state=$1
         payload='{"cmd":"SET_ACTIVITY","args":{"pid":"786","activity":{"state":"'"$state"'","details":"'"$displayed_title"'","assets":{"large_image":"'"$image_link"'","large_text":"'"$title"'","small_image":"'"$small_image"'","small_text":"powered by lobster"}}},"nonce":"'"$(date)"'"}'
@@ -745,10 +839,8 @@ EOF
         set_activity "$payload" >"$presence"
     }
 
-    ### Video Playback ###
     update_discord_presence() {
         total=$(printf "%02d:%02d:%02d" $((total_duration / 3600)) $((total_duration % 3600 / 60)) $((total_duration % 60)))
-
         [ -z "$image_link" ] && image_link="$(grep "$media_id" "$tmp_dir/image_links" | cut -f1)"
         sleep 2
 
@@ -760,7 +852,6 @@ EOF
                 position=$(printf "%02d:%02d:%02d" $((position / 3600)) $((position % 3600 / 60)) $((position % 60)))
                 update_rich_presence "$(printf "%s / %s" "$position" "$total")" &
             else
-                # Fallback method if nc or Unix domain sockets are not available
                 sleep 5
                 update_rich_presence "Watching" &
             fi
@@ -769,6 +860,7 @@ EOF
 
         rpc_cleanup
     }
+
     save_progress() {
         position=$(cat "$watchlater_dir/"* 2>/dev/null | grep -A1 "$video_link" | $sed -nE "s@start=([0-9.]*)@\1@p" | cut -d'.' -f1)
         if [ -n "$position" ]; then
@@ -777,6 +869,7 @@ EOF
             send_notification "Stopped at" "5000" "$images_cache_dir/  $title ($media_type)  $media_id.jpg" "$position"
         fi
     }
+
     play_video() {
         [ "$media_type" = "tv" ] && displayed_title="$title - $season_title - $episode_title" || displayed_title="$title"
         case $player in
@@ -798,7 +891,6 @@ EOF
                 player_cmd="$player"
                 [ -n "$resume_from" ] && player_cmd="$player_cmd --start='$resume_from'"
                 [ -n "$subs_links" ] && player_cmd="$player_cmd $subs_arg='$subs_links'"
-                # Escape ' symbols in titles to prevent unterminated string error
                 escaped_title=$(printf "%s" "$displayed_title" | "$sed" "s/'/'\\\\''/g")
                 player_cmd="$player_cmd --force-media-title='$escaped_title' '$video_link'"
                 case "$(uname -s)" in
@@ -806,12 +898,10 @@ EOF
                     *) player_cmd="$player_cmd --watch-later-directory='$watchlater_dir' --write-filename-in-watch-later-config --save-position-on-quit --quiet" ;;
                 esac
 
-                # Check if the system supports Unix domain sockets
                 if command -v nc >/dev/null 2>&1 && [ -S "$lobster_socket" ] 2>/dev/null; then
                     player_cmd="$player_cmd --input-ipc-server='$lobster_socket'"
                 fi
 
-                # Use eval to properly handle spaces in the command
                 eval "$player_cmd" >&3 &
 
                 if [ -z "$quality" ]; then
@@ -820,7 +910,7 @@ EOF
                     link=$video_link
                 fi
 
-                content=$(curl -s "$link")
+                content=$(curl_get "$link")
                 durations=$(printf "%s" "$content" | grep -oE 'EXTINF:[0-9.]+,' | cut -d':' -f2 | tr -d ',')
                 total_duration=$(printf "%s" "$durations" | xargs echo | awk '{for(i=1;i<=NF;i++)sum+=$i} END {print sum}' | cut -d'.' -f1)
 
@@ -830,7 +920,6 @@ EOF
                 ;;
             mpv_android) nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n is.xyz.mpv/.MPVActivity -e "title" "$displayed_title" >/dev/null 2>&1 & ;;
             iSH)
-                # Check if $subs_links is not empty
                 if [ -n "$subs_links" ]; then
                     first_sub=$(printf "%s" "$subs_links" | sed 's/https\\:/https:/g; s/:\([^\/]\)/#\1/g')
                 else
@@ -844,12 +933,11 @@ EOF
         esac
     }
 
-    ### Misc ###
     update_script() {
         which_lobster="$(command -v lobster)"
         [ -z "$which_lobster" ] && send_notification "Can't find lobster in PATH"
         [ -z "$which_lobster" ] && exit 1
-        update=$(curl -s "https://raw.githubusercontent.com/justchokingaround/lobster/main/lobster.sh" || exit 1)
+        update=$(curl_get "https://raw.githubusercontent.com/justchokingaround/lobster/main/lobster.sh" || exit 1)
         update="$(printf '%s\n' "$update" | diff -u "$which_lobster" -)"
         if [ -z "$update" ]; then
             send_notification "Script is up to date :)"
@@ -862,11 +950,10 @@ EOF
         fi
         exit 0
     }
-    # download_video [url] [title] [download_dir] [json_data] [thumbnail_file (only when image_preview is enabled)]
+
     download_video() {
         title="$(printf "%s" "$2" | tr -d ':/')"
         dir="${3}/${title}"
-        # ik this is dumb idc
         language=$(printf "%s" "$4" | sed -nE "s@.*\"file\":\"[^\"]*\".*\"label\":\"(.$subs_language)[,\"\ ].*@\1@p")
         num_subs="$(printf "%s" "$subs_links" | sed 's/:\([^\/]\)/\n\\1/g' | wc -l)"
         ffmpeg_subs_links=$(printf "%s" "$subs_links" | sed 's/:\([^\/]\)/\nh/g; s/\\:/:/g' | while read -r sub_link; do
@@ -878,7 +965,6 @@ EOF
         ffmpeg_maps=""
 
         if [ "$no_subs" = "true" ]; then
-            # no subtitles
             sub_ops=""
         else
             sub_ops="$ffmpeg_subs_links -map 0:v -map 0:a"
@@ -902,16 +988,15 @@ EOF
         path=$1
         section=$2
         if [ "$path" = "home" ]; then
-            response=$(curl -s "https://${base}/${path}" | $sed -n "/id=\"${section}\"/,/class=\"block_area block_area_home section-id-02\"/p" | $sed ':a;N;$!ba;s/\n//g;s/class="flw-item"/\n/g' |
+            response=$(curl_get "https://${base}/${path}" | $sed -n "/id=\"${section}\"/,/class=\"block_area block_area_home section-id-02\"/p" | $sed ':a;N;$!ba;s/\n//g;s/class="flw-item"/\n/g' |
                 $sed -nE "s@.*img data-src=\"([^\"]*)\".*<a href=\".*/(tv|movie)/watch-.*-([0-9]*)\".*title=\"([^\"]*)\".*class=\"fdi-item\">([^<]*)</span>.*@\1\t\3\t\2\t\4 [\5]@p" | $hxunent)
         else
-            response=$(curl -s "https://${base}/${path}" | $sed ':a;N;$!ba;s/\n//g;s/class="flw-item"/\n/g' |
+            response=$(curl_get "https://${base}/${path}" | $sed ':a;N;$!ba;s/\n//g;s/class="flw-item"/\n/g' |
                 $sed -nE "s@.*img data-src=\"([^\"]*)\".*<a href=\".*/(tv|movie)/watch-.*-([0-9]*)\".*title=\"([^\"]*)\".*class=\"fdi-item\">([^<]*)</span>.*@\1\t\3\t\2\t\4 [\5]@p" | $hxunent)
         fi
         main
     }
 
-    ### Main ###
     loop() {
         while [ "$keep_running" = "true" ]; do
             get_embed
@@ -959,8 +1044,16 @@ EOF
                     if [ -n "$next_episode" ]; then
                         episode_title=$(printf "%s" "$next_episode" | cut -f1)
                         data_id=$(printf "%s" "$next_episode" | cut -f2)
-                        episode_id=$(curl -s "https://${base}/ajax/v2/episode/servers/${data_id}" | $sed ':a;N;$!ba;s/\n//g;s/class="nav-item"/\n/g' | $sed -nE "s@.*data-id=\"([0-9]*)\".*title=\"([^\"]*)\".*@\1\t\2@p" | grep "$provider" | cut -f1)
-                        send_notification "Watching the next episode" "5000" "" "$episode_title"
+                        episode_id=$(
+											    curl_get "https://${base}/ajax/v2/episode/servers/${data_id}" |
+											    perl -0777 -ne '
+     											  while (/class="nav-item".*?data-id="([0-9]+)".*?title="([^"]+)"/sg) {
+            									print "$1\t$2\n";
+        										}
+    											' |
+    											grep -m1 -F "$provider" | cut -f1
+												)
+												send_notification "Watching the next episode" "5000" "" "$episode_title"
                     else
                         send_notification "No more episodes" "5000" "" "$title"
                         exit 0
@@ -987,6 +1080,7 @@ EOF
             esac
         done
     }
+
     main() {
         STATE="SEARCH"
         while :; do
@@ -1004,7 +1098,6 @@ EOF
 
     configuration
 
-    # Edge case for Windows and Android, just exits with dep_ch's error message if it can't find mpv.exe or not on Android either
     if [ "$player" = "mpv" ] && ! command -v mpv >/dev/null; then
         if command -v mpv.exe >/dev/null; then
             player="mpv.exe"
@@ -1019,7 +1112,7 @@ EOF
 
     [ "$debug" = "true" ] && set -x
     query=""
-    # Command line arguments parsing
+
     while [ $# -gt 0 ]; do
         case "$1" in
             --)
@@ -1027,7 +1120,6 @@ EOF
                 query="$*"
                 break
                 ;;
-            # TODO: don't immediately exit if --continue is passed, since this ignores other arguments as soon as -c or --continue is found
             -c | --continue) play_from_history && exit ;;
             --discord | --discord-presence | --rpc | --presence) discord_presence="true" && shift ;;
             -d | --download)
@@ -1123,16 +1215,14 @@ EOF
                 no_subs="true" && shift
                 ;;
             *)
-                if [ "${1#-}" != "$1" ]; then
-                    query="$query $1"
-                else
-                    query="$query $1"
-                fi
+                query="$query $1"
                 shift
                 ;;
         esac
     done
+
     query="$(printf "%s" "$query" | tr ' ' '-' | $sed "s/^-//g")"
+
     if [ "$image_preview" = "true" ]; then
         test -d "$images_cache_dir" || mkdir -p "$images_cache_dir"
         if [ "$use_external_menu" = "true" ]; then
@@ -1140,6 +1230,7 @@ EOF
             [ ! -L "$applications" ] && ln -sf "$tmp_dir/applications/" "$applications"
         fi
     fi
+
     [ -z "$provider" ] && provider="Vidcloud"
     [ "$trending" = "1" ] && choose_from_trending_or_recent "home" "trending-movies"
     [ "$recent" = "movie" ] && choose_from_trending_or_recent "movie" ""
@@ -1149,3 +1240,4 @@ EOF
 
 } 2>&1 | tee "$lobster_logfile" >&3 2>&4
 exec 1>&3 2>&4
+
