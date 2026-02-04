@@ -43,7 +43,7 @@ curl_get() {
     # In debug mode, show curl trace on your terminal so hangs are obvious
     if [ "$debug" = "true" ]; then
         printf "curl_get: %s\n" "$*" >"$tty" 2>/dev/null
-        _curl_stderr="$tty"
+        _curl_stderr="$lobster_logfile"
         _curl_verbose="-v"
         _curl_silent=""
     else
@@ -648,35 +648,65 @@ EOF
             exit 1
         fi
     }
+extract_from_embed() {
+    api_url="${API_URL}/?url=${embed_link}"
+    json_data=$(curl_get "${api_url}")
+    video_link=$(printf "%s" "$json_data" | $sed -nE "s_.*\"file\":\"([^\"]*\.m3u8)\".*_\1_p" | head -1)
 
-    extract_from_embed() {
-        api_url="${API_URL}/?url=${embed_link}"
-        json_data=$(curl_get "${api_url}")
-        video_link=$(printf "%s" "$json_data" | $sed -nE "s_.*\"file\":\"([^\"]*\.m3u8)\".*_\1_p" | head -1)
+    [ -n "$quality" ] && video_link=$(printf "%s" "$video_link" | sed -e "s|/playlist.m3u8|/$quality/index.m3u8|")
 
-        [ -n "$quality" ] && video_link=$(printf "%s" "$video_link" | sed -e "s|/playlist.m3u8|/$quality/index.m3u8|")
+    [ "$json_output" = "true" ] && printf "%s\n" "$json_data" && exit 0
 
-        [ "$json_output" = "true" ] && printf "%s\n" "$json_data" && exit 0
+    # Default: assume no subs
+    subs_arg=""
+    subs_links=""
 
-        if [ "$no_subs" = "true" ]; then
-            send_notification "Continuing without subtitles"
-        else
-            subs_links=$(printf "%s" "$json_data" | tr '{' '\n' | awk -v lang="$(sanitize_lang "$subs_language")" ' { if (match($0,/"file":"([^"]+)"/,f) && match($0,/"label":"([^"]+)"/,lb)) { if (index(tolower(lb[1]), lang) > 0) print f[1]; } } ')
+    if [ "$no_subs" = "true" ]; then
+        send_notification "Continuing without subtitles"
+        return 0
+    fi
 
-            if [ -z "$subs_links" ]; then
-                send_notification "No subtitles found for language '$subs_language'"
-                subs_arg=""
-            else
-                subs_arg="--sub-file"
-                num_subs=$(printf "%s" "$subs_links" | wc -l)
-                if [ "$num_subs" -gt 0 ]; then
-                    subs_links=$(printf "%s" "$subs_links" | sed -e "s/:/\\$path_thing:/g" -e "H;1h;\$!d;x;y/\n/$separator/" -e "s/$separator\$//")
-                    subs_arg="--sub-files"
-                fi
-            fi
-        fi
-    }
+    # Subtitle selection:
+    # OpenBSD's default awk (one-true-awk) does NOT support match(..., ..., array),
+    # so parse the JSON with perl (available in base).
+    #
+    # FlixHQ labels often look like: "English - English".
+    lang=$(sanitize_lang "$subs_language")
+    case "$lang" in
+        english|en)
+            lang_rx='english|(^|[^a-z0-9])(en|eng)([^a-z0-9]|$)'
+            ;;
+        *)
+            lang_rx=$(printf "%s" "$lang" | tr '[:upper:]' '[:lower:]')
+            ;;
+    esac
 
+    subs_links=$(
+        printf "%s" "$json_data"             | env LANG_RX="$lang_rx" perl -0777 -ne '
+            my $rx = $ENV{"LANG_RX"} // "";
+            while (/\"tracks\"\s*:\s*\[(.*?)\]/sg) {
+                my $b = $1;
+                while ($b =~ /\"file\"\s*:\s*\"([^\"]+)\".*?\"label\"\s*:\s*\"([^\"]+)\".*?\"kind\"\s*:\s*\"([^\"]+)\"/sg) {
+                    my ($f,$l,$k) = ($1,$2,$3);
+                    next unless $k =~ /(captions|subtitles)/i;
+                    if (lc($l) =~ /$rx/i) { print "$f\n"; }
+                }
+            }
+        '
+    )
+
+    if [ -z "$subs_links" ]; then
+        send_notification "No subtitles found for language '$subs_language'"
+        subs_arg=""
+        subs_links=""
+        return 0
+    fi
+
+    # mpv expects a list for --sub-files separated by ':' on Unix.
+    # URLs contain ':' (https://), so escape ':' as '\:'.
+    subs_arg="--sub-files"
+    subs_links=$(printf "%s" "$subs_links"             | sed -e "s/:/\\$path_thing:/g"                   -e "H;1h;\$!d;x;y/\n/$separator/"                   -e "s/$separator\$//")
+}
     ### History ###
     check_history() {
         if [ ! -f "$histfile" ]; then
