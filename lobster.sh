@@ -189,6 +189,14 @@ dep_ch() {
     done
 }
 
+### Helpers ###
+sanitize_lang() {
+    # Strip leading whitespace, then strip any leading non-alnum "marker" characters,
+    # then lowercase. This avoids BSD sed character-range pitfalls.
+    _l=$(printf "%s" "$1" | $sed -e 's/^[[:space:]]*//' -e 's/^[^[:alnum:]]*[[:space:]]*//')
+    printf "%s" "$_l" | tr '[:upper:]' '[:lower:]'
+}
+
 ### Default Configuration ###
 configuration() {
     [ -n "$XDG_CONFIG_HOME" ] && config_dir="$XDG_CONFIG_HOME/lobster" || config_dir="$HOME/.config/lobster"
@@ -202,7 +210,7 @@ configuration() {
     [ -z "$download_dir" ] && download_dir="$PWD"
     [ -z "$provider" ] && provider="Vidcloud"
     [ -z "$subs_language" ] && subs_language="english"
-    subs_language="$(printf "%s" "$subs_language" | cut -c2-)"
+    subs_language="$(sanitize_lang "$subs_language")"
     [ -z "$histfile" ] && histfile="$data_dir/lobster_history.txt" && mkdir -p "$(dirname "$histfile")"
     [ -z "$history" ] && history=false
     [ -z "$use_external_menu" ] && use_external_menu="false"
@@ -501,6 +509,7 @@ EOF
 		)
 				next_episode=$(printf "%s" "$episodes_list" | $sed -n "/$data_id/{n;p;}")
         [ -n "$next_episode" ] && return
+#PASTEHERE 
 
 				[ -z "$tmp_season_id" ] && return
         season_title=$(printf "%s" "$tmp_season_id" | cut -f1)
@@ -652,7 +661,7 @@ EOF
         if [ "$no_subs" = "true" ]; then
             send_notification "Continuing without subtitles"
         else
-            subs_links=$(printf "%s" "$json_data" | tr '{' '\n' | $sed -n "s/.*\"file\":\"\([^\"]*\)\".*\"label\":\"[^\"]*${subs_language}[^\"]*\".*/\1/Ip")
+            subs_links=$(printf "%s" "$json_data" | tr '{' '\n' | awk -v lang="$(sanitize_lang "$subs_language")" ' { if (match($0,/"file":"([^"]+)"/,f) && match($0,/"label":"([^"]+)"/,lb)) { if (index(tolower(lb[1]), lang) > 0) print f[1]; } } ')
 
             if [ -z "$subs_links" ]; then
                 send_notification "No subtitles found for language '$subs_language'"
@@ -954,7 +963,7 @@ EOF
     download_video() {
         title="$(printf "%s" "$2" | tr -d ':/')"
         dir="${3}/${title}"
-        language=$(printf "%s" "$4" | sed -nE "s@.*\"file\":\"[^\"]*\".*\"label\":\"(.$subs_language)[,\"\ ].*@\1@p")
+        language="$(sanitize_lang "$subs_language")"
         num_subs="$(printf "%s" "$subs_links" | sed 's/:\([^\/]\)/\n\\1/g' | wc -l)"
         ffmpeg_subs_links=$(printf "%s" "$subs_links" | sed 's/:\([^\/]\)/\nh/g; s/\\:/:/g' | while read -r sub_link; do
             printf " -i %s" "$sub_link"
@@ -1101,7 +1110,7 @@ EOF
     if [ "$player" = "mpv" ] && ! command -v mpv >/dev/null; then
         if command -v mpv.exe >/dev/null; then
             player="mpv.exe"
-        elif uname -a | grep -q "ndroid" 2>/dev/null; then
+        elif uname -a | grep -q "android" 2>/dev/null; then
             player="mpv_android"
         elif uname -a | grep -q "ish" 2>/dev/null; then
             player="iSH"
@@ -1154,7 +1163,7 @@ EOF
                         subs_language="english"
                         shift
                     else
-                        subs_language="$(echo "$subs_language" | cut -c2-)"
+                        subs_language="$(sanitize_lang "$subs_language")"
                         shift 2
                     fi
                 fi
@@ -1240,4 +1249,3 @@ EOF
 
 } 2>&1 | tee "$lobster_logfile" >&3 2>&4
 exec 1>&3 2>&4
-
