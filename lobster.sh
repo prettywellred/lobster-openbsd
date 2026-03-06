@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 
-LOBSTER_VERSION="4.6.0"
+LOBSTER_VERSION="4.6.1"
 
 ### General Variables ###
 config_file="$HOME/.config/lobster/lobster_config.sh"
@@ -20,6 +20,7 @@ nl='
 BACK_CODE=10
 FORWARD_CODE=11
 API_URL="https://dec.eatmynerds.live"
+API_FALLBACK_URL="https://decrypt.broggl.farm"
 
 ### Notifications ###
 command -v notify-send >/dev/null 2>&1 && notify="true" || notify="false" # check if notify-send is installed
@@ -507,9 +508,8 @@ EOF
        		 }
     		' | $hxunent
 		)
-				next_episode=$(printf "%s" "$episodes_list" | $sed -n "/$data_id/{n;p;}")
+        next_episode=$(printf "%s" "$episodes_list" | $sed -n "/$data_id/{n;p;}")
         [ -n "$next_episode" ] && return
-#PASTEHERE 
 
 				[ -z "$tmp_season_id" ] && return
         season_title=$(printf "%s" "$tmp_season_id" | cut -f1)
@@ -648,10 +648,23 @@ EOF
             exit 1
         fi
     }
-extract_from_embed() {
-    api_url="${API_URL}/?url=${embed_link}"
-    json_data=$(curl_get "${api_url}")
-    video_link=$(printf "%s" "$json_data" | $sed -nE "s_.*\"file\":\"([^\"]*\.m3u8)\".*_\1_p" | head -1)
+    extract_from_embed() {
+        api_url="${API_URL}/?url=${embed_link}"
+        json_data=$(curl_get "${api_url}")
+        video_link=$(printf "%s" "$json_data" | $sed -nE "s_.*\"file\":\"([^\"]*\.m3u8)\".*_\1_p" | head -1)
+
+    if [ -z "$video_link" ]; then
+        send_notification "Using ${API_URL} failed using ${API_FALLBACK_URL} instead"
+        api_url="${API_FALLBACK_URL}/?url=${embed_link}"
+        json_data=$(curl -s "${api_url}")
+        video_link=$(printf "%s" "$json_data" | $sed -nE "s_.*\"file\":\"([^\"]*\.m3u8)\".*_\1_p" | head -1)
+    fi
+    
+    # Exit if both sources failed
+    if [ -z "$video_link" ] && [ "$json_output" != "true" ]; then
+        send_notification "Error" "3000" "" "No sources returned, please try again later"
+        exit 1
+    fi
 
     [ -n "$quality" ] && video_link=$(printf "%s" "$video_link" | sed -e "s|/playlist.m3u8|/$quality/index.m3u8|")
 
