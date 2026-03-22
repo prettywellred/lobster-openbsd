@@ -1,5 +1,6 @@
-#!/usr/bin/env sh
+#!/bin/ksh
 
+# OpenBSD-targeted fork; ported to ksh, up to date with:
 LOBSTER_VERSION="4.6.4"
 
 ### General Variables ###
@@ -1258,4 +1259,3 @@ EOF
 
 } 2>&1 | tee "$lobster_logfile" >&3 2>&4
 exec 1>&3 2>&4
-
